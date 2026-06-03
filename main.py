@@ -437,17 +437,18 @@ async def check_cookie(m: UpdateNewMessage):
 
 
 # ── Admin: /debug_link <url> ──────────────────────────────────────────────────
-# ── Admin: /debug_link <url> ──────────────────────────────────────────────────
+# This is the replacement for the debug_link handler in main.py.
+# Replace the entire @bot.on block for /debug_link with this.
 
 @bot.on(events.NewMessage(pattern=r"^/debug_link (.+)$", incoming=True, outgoing=False, from_users=ADMINS))
 async def debug_link(m: UpdateNewMessage):
     """
-    Tests all three file-info strategies against a URL and reports each result
-    directly in Telegram — no need to check Railway logs.
+    Tests all three file-info strategies AND sign/timestamp retrieval against
+    a URL and reports each result directly in Telegram.
     """
     from terabox import (
         _try_shorturlinfo, _try_share_list, _try_page_scrape,
-        _get_bdstoken, _get_js_token,
+        _get_bdstoken, _get_js_token, _get_sign,
     )
 
     url = m.pattern_match.group(1).strip()
@@ -463,16 +464,19 @@ async def debug_link(m: UpdateNewMessage):
     h        = _h(TERABOX_COOKIE)
     bdstoken = _get_bdstoken(TERABOX_COOKIE, surl)
     js_token, log_id = _get_js_token(surl, TERABOX_COOKIE)
+    sign, timestamp  = _get_sign(surl, TERABOX_COOKIE)
 
     report = [
         f"**surl:** `{surl}`",
         f"**bdstoken:** {chr(10004) + ' `' + bdstoken[:16] + '…`' if bdstoken else chr(10060) + ' not found'}",
         f"**jsToken:**  {chr(10004) + ' found' if js_token else chr(9888) + ' not found (non-fatal)'}",
+        f"**sign:**     {chr(10004) + ' found' if sign else chr(10060) + ' NOT found — download will likely fail (errno=2)'}",
+        f"**timestamp:**`{timestamp or 'not found'}`",
     ]
 
     await msg.edit("\n".join(report) + "\n\n⏳ Testing Strategy A…", parse_mode="markdown")
 
-    # Strategy A: shorturlinfo
+    # Strategy A
     files_a, shareid_a, uk_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
     if files_a:
         f0 = files_a[0]
@@ -480,58 +484,66 @@ async def debug_link(m: UpdateNewMessage):
             f"**A (shorturlinfo):** ✅\n"
             f"  File: `{f0.get('server_filename', '?')}`\n"
             f"  Size: `{f0.get('size', '?')}`\n"
-            f"  shareid: `{shareid_a}`"
+            f"  shareid: `{shareid_a}` | uk: `{uk_a}`"
         )
     else:
-        report.append(f"**A (shorturlinfo):** ❌ {err_a}")
+        report.append(
+            f"**A (shorturlinfo):** ❌ {err_a}\n"
+            f"  shareid recovered: `{shareid_a or 'none'}` | uk: `{uk_a or 'none'}`"
+        )
 
     await msg.edit("\n\n".join(report) + "\n\n⏳ Testing Strategy B…", parse_mode="markdown")
 
-    # Strategy B: share/list
+    # Strategy B
     files_b, err_b = _try_share_list(surl, bdstoken, js_token, log_id, h)
     if files_b:
         f0 = files_b[0]
         report.append(
             f"**B (share/list):** ✅\n"
             f"  File: `{f0.get('server_filename', '?')}`\n"
-            f"  fs_id: `{f0.get('fs_id', '?')}`"
+            f"  fs\\_id: `{f0.get('fs_id', '?')}`\n"
+            f"  dlink in list: {'yes ✅' if f0.get('dlink') else 'no ⚠️'}"
         )
     else:
         report.append(f"**B (share/list):** ❌ {err_b}")
 
     await msg.edit("\n\n".join(report) + "\n\n⏳ Testing Strategy C…", parse_mode="markdown")
 
-    # Strategy C: page scrape
+    # Strategy C
     files_c, shareid_c, uk_c, err_c = _try_page_scrape(surl, TERABOX_COOKIE)
     if files_c:
         f0 = files_c[0]
         report.append(
             f"**C (page scrape):** ✅\n"
             f"  File: `{f0.get('server_filename', '?')}`\n"
-            f"  dlink in list: {'yes' if f0.get('dlink') else 'no'}"
+            f"  shareid: `{shareid_c or 'none'}` | uk: `{uk_c or 'none'}`\n"
+            f"  dlink in list: {'yes ✅' if f0.get('dlink') else 'no'}"
         )
     else:
         report.append(f"**C (page scrape):** ❌ {err_c}")
 
-    # Cookie health check
+    # Cookie health
     try:
         qr     = requests.get("https://www.terabox.com/api/quota",
                               params={"checkexpire": "1", "app_id": "250528"},
                               headers=h, timeout=10)
         qerrno = qr.json().get("errno", -1)
-        report.append(f"**Cookie health:** {'✅ valid' if qerrno == 0 else f'❌ errno={qerrno}'}")
+        report.append(f"**Cookie health:** {'✅ valid (errno=0)' if qerrno == 0 else f'❌ errno={qerrno}'}")
     except Exception as e:
         report.append(f"**Cookie health:** ❌ {e}")
 
+    # Summary
     any_ok = files_a or files_b or files_c
     report.append(
-        "**Overall:** ✅ At least one strategy works — download should succeed."
+        "**Overall:** ✅ At least one file-info strategy works.\n"
+        + ("⚠️ But **sign not found** — download step will still fail. "
+           "Check if the share page loads in a browser with your cookie."
+           if not sign else "✅ sign+timestamp obtained — download should succeed.")
         if any_ok else
         "**Overall:** ❌ All strategies failed. Send this output for further help."
     )
 
     await msg.edit("\n\n".join(report), parse_mode="markdown")
-
 
 # ── Chat-join tracking ────────────────────────────────────────────────────────
 
