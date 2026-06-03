@@ -1,17 +1,18 @@
 """
 Self-contained Terabox resolver.
-Uses your own Terabox session cookies against Terabox's web API.
-A free Terabox account works for publicly shared files.
+get_data() returns (dict, "") on success or (None, "reason") on failure.
 
-get_data() returns (dict, "") on success OR (None, "reason") on failure.
-
-errno=4000020 fix: Terabox now requires a `bdstoken` parameter on most API calls.
-bdstoken == csrfToken from your cookie. We now extract it automatically.
+errno=4000020 investigation:
+  - Cookie valid ✅  - bdstoken found ✅  - but share/list still 4000020
+  This means Terabox changed share/list to need extra params beyond bdstoken.
+  Fix: use shorturlinfo as primary source (less strict), plus page scraping
+  as fallback.
 """
 
+import json
 import re
 import requests
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, unquote
 
 from tools import get_formatted_size
 
@@ -46,13 +47,6 @@ _JS_PATTERNS = [
     r"jsToken\s*=\s*['\"]([^'\"]+)['\"]",
     r"'jsToken'\s*:\s*'([^']+)'",
     r'window\.jsToken\s*=\s*"([^"]+)"',
-    r'jsToken\s*:\s*"([^"]+)"',
-]
-
-_BDSTOKEN_PATTERNS = [
-    r'"bdstoken"\s*:\s*"([^"]+)"',
-    r"bdstoken\s*=\s*['\"]([^'\"]+)['\"]",
-    r"'bdstoken'\s*:\s*'([^']+)'",
 ]
 
 
@@ -76,79 +70,54 @@ def extract_surl(url: str) -> str | None:
     return qs["surl"][0] if "surl" in qs else None
 
 
-def _h(cookie: str) -> dict:
-    return {**_BASE, "Cookie": cookie}
+def _h(cookie: str, referer: str = "https://www.terabox.com/") -> dict:
+    return {**_BASE, "Cookie": cookie, "Referer": referer}
 
-
-# ── Token extraction ───────────────────────────────────────────────────────────
 
 def _cookie_field(cookie: str, key: str) -> str:
-    """Extract a single field value from a Cookie header string."""
     m = re.search(rf'(?:^|;)\s*{re.escape(key)}=([^;]+)', cookie)
-    return m.group(1).strip() if m else ""
+    return unquote(m.group(1).strip()) if m else ""   # URL-decode automatically
 
+
+# ── Token helpers ──────────────────────────────────────────────────────────────
 
 def _get_bdstoken(cookie: str, surl: str) -> str:
-    """
-    bdstoken is required by Terabox's share/list and download APIs.
-    It equals csrfToken from the session cookie in almost all cases.
-    Falls back to fetching it from the API or page source.
-    """
-    # Strategy 1 (fastest): csrfToken from cookie string
-    csrf = _cookie_field(cookie, "csrfToken")
+    """bdstoken = URL-decoded csrfToken from cookie in almost all cases."""
+    csrf = _cookie_field(cookie, "csrfToken")   # already URL-decoded by _cookie_field
     if csrf:
-        print(f"[Terabox] bdstoken from cookie csrfToken: {csrf[:12]}…")
+        print(f"[Terabox] bdstoken (csrfToken): {csrf[:16]}…")
         return csrf
 
-    h = _h(cookie)
-
-    # Strategy 2: dedicated API endpoint
+    # Fallback: dedicated API
     try:
-        r = requests.get(
+        r   = requests.get(
             "https://www.terabox.com/api/gettemplatevariable",
             params={"fields": '["bdstoken"]'},
-            headers=h, timeout=10,
+            headers=_h(cookie), timeout=10,
         )
         tok = r.json().get("result", {}).get("bdstoken", "")
         if tok:
-            print(f"[Terabox] bdstoken from gettemplatevariable: {tok[:12]}…")
+            print(f"[Terabox] bdstoken from API: {tok[:16]}…")
             return tok
-    except Exception as e:
-        print(f"[Terabox] gettemplatevariable failed: {e}")
+    except Exception:
+        pass
 
-    # Strategy 3: scrape from share page HTML
+    print("[Terabox] ⚠ bdstoken not found")
+    return ""
+
+
+def _get_js_token(surl: str, cookie: str) -> tuple[str, str]:
+    """Returns (js_token, log_id) from the share page."""
+    h = _h(cookie)
     for page_url in [
         f"https://www.terabox.com/wap/share/filelist?surl={surl}",
         f"https://www.terabox.com/sharing/link?surl={surl}",
     ]:
         try:
-            r = requests.get(page_url, headers=h, timeout=20)
-            for pat in _BDSTOKEN_PATTERNS:
-                m = re.search(pat, r.text)
-                if m:
-                    print(f"[Terabox] bdstoken from page {page_url}: {m.group(1)[:12]}…")
-                    return m.group(1)
-        except Exception:
-            pass
-
-    print("[Terabox] ⚠ bdstoken not found — API calls may fail with errno=4000020")
-    return ""
-
-
-def _get_page_tokens(surl: str, cookie: str) -> tuple[str, str]:
-    """Returns (js_token, log_id) by scraping the share page."""
-    h = _h(cookie)
-    pages = [
-        f"https://www.terabox.com/wap/share/filelist?surl={surl}",
-        f"https://www.terabox.com/sharing/link?surl={surl}",
-        f"https://www.terabox.com/s/{surl}",
-    ]
-    for page_url in pages:
-        try:
             r = requests.get(page_url, headers=h, timeout=20, allow_redirects=True)
             if r.status_code != 200:
                 continue
-            text = r.text
+            text     = r.text
             js_token = ""
             for pat in _JS_PATTERNS:
                 m = re.search(pat, text)
@@ -158,120 +127,239 @@ def _get_page_tokens(surl: str, cookie: str) -> tuple[str, str]:
             logid_m = re.search(r'dp-logid=([^&\s"\']+)', text)
             log_id  = logid_m.group(1) if logid_m else "0"
             if js_token:
-                print(f"[Terabox] jsToken found via {page_url}")
                 return js_token, log_id
-        except Exception as e:
-            print(f"[Terabox] Page {page_url} failed: {e}")
-    print("[Terabox] jsToken not found — continuing without it")
+        except Exception:
+            pass
     return "", "0"
 
 
-# ── API steps ──────────────────────────────────────────────────────────────────
+# ── File info strategies (ordered best → last resort) ─────────────────────────
 
-def _get_file_list(surl: str, js_token: str, bdstoken: str,
-                   log_id: str, h: dict) -> tuple[list | None, str]:
-    params = {
-        "app_id": "250528", "web":  "1",
-        "shorturl": surl,   "root": "1",
-        "num": "20",        "page": "1",
-        "by": "name",       "order": "asc",
+def _try_shorturlinfo(surl: str, bdstoken: str, h: dict) -> tuple[list | None, str, str, str]:
+    """
+    Strategy A — shorturlinfo.
+    Sometimes returns the full file list directly AND shareid/uk.
+    Less strictly enforced than share/list.
+    Returns (files, shareid, uk, error).
+    """
+    for params in [
+        {"app_id": "250528", "web": "1", "shorturl": surl, "root": "1", "bdstoken": bdstoken},
+        {"app_id": "250528", "web": "1", "shorturl": surl, "root": "1"},
+        {"app_id": "250528",             "shorturl": surl, "root": "1"},
+    ]:
+        try:
+            r     = requests.get("https://www.terabox.com/api/shorturlinfo",
+                                 params=params, headers=h, timeout=20)
+            data  = r.json()
+            errno = data.get("errno", -1)
+            if errno != 0:
+                continue
+            shareid = str(data.get("shareid", ""))
+            uk      = str(data.get("uk", ""))
+            files   = data.get("list", [])
+            if files:
+                print(f"[Terabox] ✅ Strategy A (shorturlinfo) — {len(files)} file(s)")
+                return files, shareid, uk, ""
+            # Got shareid/uk but no list — still useful for later
+            return None, shareid, uk, "shorturlinfo returned no list"
+        except Exception as e:
+            continue
+    return None, "", "", "shorturlinfo failed all parameter combos"
+
+
+def _try_share_list(surl: str, bdstoken: str, js_token: str,
+                    log_id: str, h: dict) -> tuple[list | None, str]:
+    """
+    Strategy B — share/list with multiple parameter combos.
+    Returns (files, error).
+    """
+    base = {
+        "app_id": "250528", "web": "1", "shorturl": surl, "root": "1",
+        "num": "20", "page": "1", "by": "name", "order": "asc",
     }
-    if js_token:
-        params["jsToken"]  = js_token
-    if bdstoken:
-        params["bdstoken"] = bdstoken      # ← THE FIX for errno=4000020
-    if log_id and log_id != "0":
-        params["dp-logid"] = log_id
+    combos = [
+        # bdstoken + jsToken + logid (full)
+        {**base, "bdstoken": bdstoken, "jsToken": js_token, "dp-logid": log_id},
+        # bdstoken only (no jsToken)
+        {**base, "bdstoken": bdstoken},
+        # bdstoken + channel/clienttype (some Terabox versions need these)
+        {**base, "bdstoken": bdstoken, "channel": "dubox", "clienttype": "0"},
+        # no bdstoken at all — cookie-only
+        {**base},
+    ]
+    for params in combos:
+        # Remove empty-string values
+        params = {k: v for k, v in params.items() if v and v != "0"}
+        try:
+            r     = requests.get("https://www.terabox.com/share/list",
+                                 params=params, headers=h, timeout=20)
+            data  = r.json()
+            errno = data.get("errno", -1)
+            if errno == 0:
+                files = data.get("list", [])
+                if files:
+                    print(f"[Terabox] ✅ Strategy B (share/list) params={list(params.keys())}")
+                    return files, ""
+            # Log but keep trying
+            print(f"[Terabox] share/list errno={errno} for params={list(params.keys())}")
+        except Exception as e:
+            print(f"[Terabox] share/list error: {e}")
+    return None, "share/list failed all parameter combos"
 
-    try:
-        r     = requests.get("https://www.terabox.com/share/list",
-                             params=params, headers=h, timeout=20)
-        data  = r.json()
-        errno = data.get("errno", -1)
-        if errno != 0:
-            hints = {
-                -6:       " → cookie expired/invalid, refresh TERABOX_COOKIE",
-                -9:       " → link broken or expired",
-                 2:       " → link needs a password (not supported)",
-                 4000020: " → bdstoken missing or wrong (check csrfToken in cookie)",
-            }
-            return None, f"share/list errno={errno}{hints.get(errno, '')}"
-        files = data.get("list", [])
-        return (files or None), ("" if files else "share/list returned empty list")
-    except Exception as e:
-        return None, f"share/list request error: {e}"
+
+def _try_page_scrape(surl: str, cookie: str) -> tuple[list | None, str, str, str]:
+    """
+    Strategy C — scrape file data embedded in the share page HTML.
+    Completely bypasses the share/list API.
+    Returns (files, shareid, uk, error).
+    """
+    h = _h(cookie)
+    pages = [
+        f"https://www.terabox.com/wap/share/filelist?surl={surl}",
+        f"https://www.terabox.com/s/{surl}",
+        f"https://www.terabox.com/sharing/link?surl={surl}",
+    ]
+    for page_url in pages:
+        try:
+            r = requests.get(page_url, headers=h, timeout=25, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            text = r.text
+
+            # Pattern 1: locals.mset({...list:[...]...})
+            m = re.search(r'locals\.mset\((\{.{50,}\})\)', text, re.DOTALL)
+            if m:
+                try:
+                    obj     = json.loads(m.group(1))
+                    files   = obj.get("list", [])
+                    shareid = str(obj.get("shareid", ""))
+                    uk      = str(obj.get("uk", ""))
+                    if files:
+                        print(f"[Terabox] ✅ Strategy C (locals.mset) via {page_url}")
+                        return files, shareid, uk, ""
+                except Exception:
+                    pass
+
+            # Pattern 2: window.__redux_state__ = {...}
+            m = re.search(r'window\.__redux_state__\s*=\s*(\{.+?\})\s*;', text, re.DOTALL)
+            if m:
+                try:
+                    obj   = json.loads(m.group(1))
+                    share = obj.get("share", {})
+                    files = (share.get("fileinfo", {}).get("list", [])
+                             or share.get("list", []))
+                    if files:
+                        print(f"[Terabox] ✅ Strategy C (__redux_state__) via {page_url}")
+                        return files, str(share.get("shareid", "")), str(share.get("uk", "")), ""
+                except Exception:
+                    pass
+
+            # Pattern 3: bare "list":[{...}] JSON fragment
+            m = re.search(r'"list"\s*:\s*(\[\{.+?\}\])', text, re.DOTALL)
+            if m:
+                try:
+                    files = json.loads(m.group(1))
+                    if files and isinstance(files, list) and files[0].get("fs_id"):
+                        print(f"[Terabox] ✅ Strategy C (list fragment) via {page_url}")
+                        return files, "", "", ""
+                except Exception:
+                    pass
+
+        except Exception as e:
+            print(f"[Terabox] Page scrape {page_url} failed: {e}")
+
+    return None, "", "", "page scraping found no file data"
 
 
-def _get_shareid_uk(surl: str, bdstoken: str, h: dict) -> tuple[str, str]:
-    params = {"app_id": "250528", "shorturl": surl, "root": "1"}
-    if bdstoken:
-        params["bdstoken"] = bdstoken
-    try:
-        r    = requests.get("https://www.terabox.com/api/shorturlinfo",
-                            params=params, headers=h, timeout=20)
-        info = r.json()
-        # shorturlinfo sometimes contains the file list too — opportunistic grab
-        return str(info.get("shareid", "")), str(info.get("uk", ""))
-    except Exception:
-        return "", ""
-
+# ── Download link ──────────────────────────────────────────────────────────────
 
 def _get_dlink(surl: str, fs_id: str, shareid: str, uk: str,
                js_token: str, bdstoken: str, log_id: str,
                h: dict) -> tuple[str | None, str]:
-    params = {
-        "app_id":  "250528", "web":     "1",
-        "shorturl": surl,    "fs_id":   fs_id,
-        "shareId": shareid,  "uk":      uk,
-    }
-    if js_token:
-        params["jsToken"]  = js_token
-    if bdstoken:
-        params["bdstoken"] = bdstoken      # ← also needed here
-    if log_id and log_id != "0":
-        params["dplogid"]  = log_id
-
-    try:
-        r     = requests.get("https://www.terabox.com/api/download",
-                             params=params, headers=h, timeout=20)
-        data  = r.json()
-        errno = data.get("errno", -1)
-        if errno != 0:
-            return None, f"download API errno={errno} ({data.get('errmsg', '')})"
-        dlink = data.get("dlink", "")
-        return (dlink or None), ("" if dlink else "download API returned no dlink")
-    except Exception as e:
-        return None, f"download API error: {e}"
+    combos = [
+        {"app_id": "250528", "web": "1", "shorturl": surl, "fs_id": fs_id,
+         "shareId": shareid, "uk": uk, "jsToken": js_token,
+         "bdstoken": bdstoken, "dplogid": log_id},
+        {"app_id": "250528", "web": "1", "shorturl": surl, "fs_id": fs_id,
+         "shareId": shareid, "uk": uk, "bdstoken": bdstoken},
+        {"app_id": "250528", "web": "1", "shorturl": surl, "fs_id": fs_id,
+         "shareId": shareid, "uk": uk},
+    ]
+    for params in combos:
+        params = {k: v for k, v in params.items() if v and v != "0"}
+        try:
+            r     = requests.get("https://www.terabox.com/api/download",
+                                 params=params, headers=h, timeout=20)
+            data  = r.json()
+            errno = data.get("errno", -1)
+            if errno == 0:
+                dlink = data.get("dlink", "")
+                if dlink:
+                    print(f"[Terabox] ✅ dlink obtained")
+                    return dlink, ""
+            print(f"[Terabox] download API errno={errno}")
+        except Exception as e:
+            print(f"[Terabox] download API error: {e}")
+    return None, "download API failed all parameter combos"
 
 
 # ── Main resolver ──────────────────────────────────────────────────────────────
 
 def get_data(url: str, cookie: str) -> tuple[dict | None, str]:
     """
-    Returns (data_dict, "")          on success
-    Returns (None,  "reason string") on failure  ← shown in Telegram
+    Returns (data_dict, "")        on success
+    Returns (None, "reason string") on failure  ← shown in Telegram
     """
     if not cookie:
-        return None, "TERABOX_COOKIE is not set — check your env variables"
+        return None, "TERABOX_COOKIE is not set"
 
     surl = extract_surl(url)
     if not surl:
-        return None, f"Could not extract surl from URL: {url}"
+        return None, f"Could not extract surl from: {url}"
 
-    h = _h(cookie)
-    print(f"\n[Terabox] ── Resolving surl={surl} ─────────────────────")
+    h        = _h(cookie)
+    bdstoken = _get_bdstoken(cookie, surl)
+    js_token, log_id = _get_js_token(surl, cookie)
 
-    # ── Gather tokens ─────────────────────────────────────────────────────────
-    bdstoken             = _get_bdstoken(cookie, surl)
-    js_token, log_id     = _get_page_tokens(surl, cookie)
+    print(f"\n[Terabox] ── surl={surl} | bds={'yes' if bdstoken else 'no'} | js={'yes' if js_token else 'no'} ──")
 
-    # ── File list: try with all tokens, then without jsToken ──────────────────
-    files, err = _get_file_list(surl, js_token, bdstoken, log_id, h)
-    if files is None and js_token:
-        print(f"[Terabox] Retry share/list without jsToken…")
-        files, err = _get_file_list(surl, "", bdstoken, "0", h)
-    if files is None:
-        return None, err
+    # ── Collect file info: try A → B → C ──────────────────────────────────────
+    files = shareid = uk = None
+
+    # Strategy A: shorturlinfo
+    files_a, shareid_a, uk_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
+    if files_a:
+        files, shareid, uk = files_a, shareid_a, uk_a
+    else:
+        shareid, uk = shareid_a, uk_a   # might have gotten shareid/uk even without list
+
+    # Strategy B: share/list (only if A didn't give us files)
+    if not files:
+        files_b, err_b = _try_share_list(surl, bdstoken, js_token, log_id, h)
+        if files_b:
+            files = files_b
+
+    # Strategy C: page scraping (last resort)
+    if not files:
+        files_c, shareid_c, uk_c, err_c = _try_page_scrape(surl, cookie)
+        if files_c:
+            files   = files_c
+            shareid = shareid or shareid_c
+            uk      = uk or uk_c
+
+    if not files:
+        return None, (
+            f"All strategies failed.\n"
+            f"A (shorturlinfo): {err_a}\n"
+            f"B (share/list): {err_b}\n"
+            f"C (page scrape): {err_c}"
+        )
+
+    # Get shareid/uk if still missing
+    if not shareid or not uk:
+        shareid_x, uk_x = _try_shorturlinfo(surl, bdstoken, h)[1:3]
+        shareid = shareid or shareid_x
+        uk      = uk      or uk_x
 
     file      = files[0]
     fs_id     = str(file["fs_id"])
@@ -279,34 +367,26 @@ def get_data(url: str, cookie: str) -> tuple[dict | None, str]:
     size      = int(file.get("size", 0))
     thumbs    = file.get("thumbs", {})
     thumb     = thumbs.get("url3") or thumbs.get("url1") or ""
-    list_dlink = file.get("dlink", "")  # sometimes present in the list itself
+    list_dlink = file.get("dlink", "")
 
-    print(f"[Terabox] File: {filename} | {get_formatted_size(size)} | fs_id={fs_id}")
+    print(f"[Terabox] File: {filename} | {get_formatted_size(size)}")
 
-    # ── shareid + uk ──────────────────────────────────────────────────────────
-    shareid, uk = _get_shareid_uk(surl, bdstoken, h)
-    print(f"[Terabox] shareid={shareid or '(empty)'} | uk={uk or '(empty)'}")
-
-    # ── Download link: with tokens → without jsToken → list fallback ──────────
+    # ── Download link ─────────────────────────────────────────────────────────
     dlink, dl_err = _get_dlink(surl, fs_id, shareid, uk, js_token, bdstoken, log_id, h)
-    if not dlink and js_token:
-        print("[Terabox] Retry dlink without jsToken…")
-        dlink, dl_err = _get_dlink(surl, fs_id, shareid, uk, "", bdstoken, "0", h)
     if not dlink and list_dlink:
-        print("[Terabox] Using dlink embedded in file list (fallback)")
+        print("[Terabox] Using dlink from file list")
         dlink = list_dlink
     if not dlink:
-        return None, dl_err
+        return None, f"Could not get download link: {dl_err}"
 
-    # ── Resolve CDN redirect ──────────────────────────────────────────────────
+    # ── Follow CDN redirect ───────────────────────────────────────────────────
     try:
         final      = requests.head(dlink, headers=h, allow_redirects=True, timeout=20)
         direct_url = final.url
     except Exception:
         direct_url = dlink
 
-    print(f"[Terabox] ✅ Resolved: {filename}")
-
+    print(f"[Terabox] ✅ Done: {filename}")
     return {
         "file_name":   filename,
         "size":        get_formatted_size(size),
