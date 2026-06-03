@@ -2,11 +2,16 @@
 Self-contained Terabox resolver.
 get_data() returns (dict, "") on success or (None, "reason") on failure.
 
-errno=4000020 investigation:
-  - Cookie valid ✅  - bdstoken found ✅  - but share/list still 4000020
-  This means Terabox changed share/list to need extra params beyond bdstoken.
-  Fix: use shorturlinfo as primary source (less strict), plus page scraping
-  as fallback.
+Fixes applied (vs previous version):
+  1. Added _get_sign() — Terabox now requires sign+timestamp in the download
+     API (errno=2 without them).  Sign is scraped from the share-page HTML or
+     the /api/getsign endpoint.
+  2. _get_dlink() updated to pass sign+timestamp (with fallback combos for
+     older API behaviour).
+  3. Fixed NameError: err_b and err_c are pre-initialised to "not attempted".
+  4. Strategy C now also runs when files were found but shareid/uk are still
+     missing — the download API needs those even when Strategy B won.
+  5. dplogid param name corrected to dp-logid throughout _get_dlink combos.
 """
 
 import json
@@ -76,19 +81,18 @@ def _h(cookie: str, referer: str = "https://www.terabox.com/") -> dict:
 
 def _cookie_field(cookie: str, key: str) -> str:
     m = re.search(rf'(?:^|;)\s*{re.escape(key)}=([^;]+)', cookie)
-    return unquote(m.group(1).strip()) if m else ""   # URL-decode automatically
+    return unquote(m.group(1).strip()) if m else ""
 
 
 # ── Token helpers ──────────────────────────────────────────────────────────────
 
 def _get_bdstoken(cookie: str, surl: str) -> str:
     """bdstoken = URL-decoded csrfToken from cookie in almost all cases."""
-    csrf = _cookie_field(cookie, "csrfToken")   # already URL-decoded by _cookie_field
+    csrf = _cookie_field(cookie, "csrfToken")
     if csrf:
         print(f"[Terabox] bdstoken (csrfToken): {csrf[:16]}…")
         return csrf
 
-    # Fallback: dedicated API
     try:
         r   = requests.get(
             "https://www.terabox.com/api/gettemplatevariable",
@@ -133,13 +137,60 @@ def _get_js_token(surl: str, cookie: str) -> tuple[str, str]:
     return "", "0"
 
 
-# ── File info strategies (ordered best → last resort) ─────────────────────────
+# ── FIX 1: new _get_sign() ─────────────────────────────────────────────────────
+
+def _get_sign(surl: str, cookie: str) -> tuple[str, str]:
+    """
+    Returns (sign, timestamp) required by the Terabox download API.
+
+    Terabox added mandatory sign verification to /api/download in late 2023.
+    Requests without a valid sign receive errno=2.  The sign is a short-lived
+    HMAC embedded in every share page — we scrape it directly from the HTML
+    rather than trying to recompute it client-side.
+    """
+    h = _h(cookie)
+
+    # Primary: scrape from share page HTML (most reliable)
+    for page_url in [
+        f"https://www.terabox.com/wap/share/filelist?surl={surl}",
+        f"https://www.terabox.com/sharing/link?surl={surl}",
+        f"https://www.terabox.com/s/{surl}",
+    ]:
+        try:
+            r = requests.get(page_url, headers=h, timeout=20, allow_redirects=True)
+            if r.status_code != 200:
+                continue
+            text = r.text
+            # Sign is always a long alphanumeric/base64 blob
+            sign_m = re.search(r'"sign"\s*:\s*"([A-Za-z0-9+/=]{20,})"', text)
+            ts_m   = re.search(r'"timestamp"\s*:\s*["\']?(\d{10,})["\']?', text)
+            if sign_m:
+                ts = ts_m.group(1) if ts_m else ""
+                print(f"[Terabox] sign from page: …{sign_m.group(1)[-8:]} ts={ts}")
+                return sign_m.group(1), ts
+        except Exception as e:
+            print(f"[Terabox] _get_sign {page_url}: {e}")
+
+    # Fallback: dedicated getsign endpoint
+    try:
+        r    = requests.get("https://www.terabox.com/api/getsign", headers=h, timeout=10)
+        data = r.json()
+        if data.get("sign"):
+            ts = str(data.get("timestamp", ""))
+            print(f"[Terabox] sign from /api/getsign: …{data['sign'][-8:]}")
+            return data["sign"], ts
+    except Exception:
+        pass
+
+    print("[Terabox] ⚠ sign not found — /api/download may return errno=2")
+    return "", ""
+
+
+# ── File info strategies ───────────────────────────────────────────────────────
 
 def _try_shorturlinfo(surl: str, bdstoken: str, h: dict) -> tuple[list | None, str, str, str]:
     """
     Strategy A — shorturlinfo.
-    Sometimes returns the full file list directly AND shareid/uk.
-    Less strictly enforced than share/list.
     Returns (files, shareid, uk, error).
     """
     for params in [
@@ -160,9 +211,8 @@ def _try_shorturlinfo(surl: str, bdstoken: str, h: dict) -> tuple[list | None, s
             if files:
                 print(f"[Terabox] ✅ Strategy A (shorturlinfo) — {len(files)} file(s)")
                 return files, shareid, uk, ""
-            # Got shareid/uk but no list — still useful for later
             return None, shareid, uk, "shorturlinfo returned no list"
-        except Exception as e:
+        except Exception:
             continue
     return None, "", "", "shorturlinfo failed all parameter combos"
 
@@ -178,17 +228,12 @@ def _try_share_list(surl: str, bdstoken: str, js_token: str,
         "num": "20", "page": "1", "by": "name", "order": "asc",
     }
     combos = [
-        # bdstoken + jsToken + logid (full)
         {**base, "bdstoken": bdstoken, "jsToken": js_token, "dp-logid": log_id},
-        # bdstoken only (no jsToken)
         {**base, "bdstoken": bdstoken},
-        # bdstoken + channel/clienttype (some Terabox versions need these)
         {**base, "bdstoken": bdstoken, "channel": "dubox", "clienttype": "0"},
-        # no bdstoken at all — cookie-only
         {**base},
     ]
     for params in combos:
-        # Remove empty-string values
         params = {k: v for k, v in params.items() if v and v != "0"}
         try:
             r     = requests.get("https://www.terabox.com/share/list",
@@ -200,7 +245,6 @@ def _try_share_list(surl: str, bdstoken: str, js_token: str,
                 if files:
                     print(f"[Terabox] ✅ Strategy B (share/list) params={list(params.keys())}")
                     return files, ""
-            # Log but keep trying
             print(f"[Terabox] share/list errno={errno} for params={list(params.keys())}")
         except Exception as e:
             print(f"[Terabox] share/list error: {e}")
@@ -210,7 +254,6 @@ def _try_share_list(surl: str, bdstoken: str, js_token: str,
 def _try_page_scrape(surl: str, cookie: str) -> tuple[list | None, str, str, str]:
     """
     Strategy C — scrape file data embedded in the share page HTML.
-    Completely bypasses the share/list API.
     Returns (files, shareid, uk, error).
     """
     h = _h(cookie)
@@ -226,7 +269,6 @@ def _try_page_scrape(surl: str, cookie: str) -> tuple[list | None, str, str, str
                 continue
             text = r.text
 
-            # Pattern 1: locals.mset({...list:[...]...})
             m = re.search(r'locals\.mset\((\{.{50,}\})\)', text, re.DOTALL)
             if m:
                 try:
@@ -240,7 +282,6 @@ def _try_page_scrape(surl: str, cookie: str) -> tuple[list | None, str, str, str
                 except Exception:
                     pass
 
-            # Pattern 2: window.__redux_state__ = {...}
             m = re.search(r'window\.__redux_state__\s*=\s*(\{.+?\})\s*;', text, re.DOTALL)
             if m:
                 try:
@@ -254,7 +295,6 @@ def _try_page_scrape(surl: str, cookie: str) -> tuple[list | None, str, str, str
                 except Exception:
                     pass
 
-            # Pattern 3: bare "list":[{...}] JSON fragment
             m = re.search(r'"list"\s*:\s*(\[\{.+?\}\])', text, re.DOTALL)
             if m:
                 try:
@@ -271,22 +311,42 @@ def _try_page_scrape(surl: str, cookie: str) -> tuple[list | None, str, str, str
     return None, "", "", "page scraping found no file data"
 
 
-# ── Download link ──────────────────────────────────────────────────────────────
+# ── FIX 2: _get_dlink now accepts sign + timestamp ─────────────────────────────
 
 def _get_dlink(surl: str, fs_id: str, shareid: str, uk: str,
                js_token: str, bdstoken: str, log_id: str,
+               sign: str, timestamp: str,
                h: dict) -> tuple[str | None, str]:
+    """
+    Try the Terabox download API with several parameter combinations.
+
+    Combos are ordered best-first:
+      1. Full params with sign+timestamp  (required since ~late 2023)
+      2. sign+timestamp without jsToken
+      3. sign+timestamp, no auth tokens at all
+      4-6. Legacy combos without sign (kept as last-ditch fallback)
+    """
+    base  = {"app_id": "250528", "web": "1", "shorturl": surl, "fs_id": fs_id}
+    share = {"shareId": shareid, "uk": uk}
+
     combos = [
-        {"app_id": "250528", "web": "1", "shorturl": surl, "fs_id": fs_id,
-         "shareId": shareid, "uk": uk, "jsToken": js_token,
-         "bdstoken": bdstoken, "dplogid": log_id},
-        {"app_id": "250528", "web": "1", "shorturl": surl, "fs_id": fs_id,
-         "shareId": shareid, "uk": uk, "bdstoken": bdstoken},
-        {"app_id": "250528", "web": "1", "shorturl": surl, "fs_id": fs_id,
-         "shareId": shareid, "uk": uk},
+        # ── With sign (preferred) ──────────────────────────────────────────
+        {**base, **share, "sign": sign, "timestamp": timestamp,
+         "jsToken": js_token, "bdstoken": bdstoken, "dp-logid": log_id},
+        {**base, **share, "sign": sign, "timestamp": timestamp,
+         "bdstoken": bdstoken},
+        {**base, **share, "sign": sign, "timestamp": timestamp},
+        # ── Legacy without sign ────────────────────────────────────────────
+        {**base, **share, "jsToken": js_token,
+         "bdstoken": bdstoken, "dp-logid": log_id},
+        {**base, **share, "bdstoken": bdstoken},
+        {**base, **share},
     ]
+
+    errors = []
     for params in combos:
-        params = {k: v for k, v in params.items() if v and v != "0"}
+        # Strip empty / zero values so they don't pollute the query string
+        params = {k: v for k, v in params.items() if v and v not in ("", "0")}
         try:
             r     = requests.get("https://www.terabox.com/api/download",
                                  params=params, headers=h, timeout=20)
@@ -295,19 +355,24 @@ def _get_dlink(surl: str, fs_id: str, shareid: str, uk: str,
             if errno == 0:
                 dlink = data.get("dlink", "")
                 if dlink:
-                    print(f"[Terabox] ✅ dlink obtained")
+                    print("[Terabox] ✅ dlink obtained")
                     return dlink, ""
-            print(f"[Terabox] download API errno={errno}")
+            errmsg = data.get("errmsg", "")
+            err    = f"errno={errno}({errmsg}) keys={list(params.keys())}"
+            errors.append(err)
+            print(f"[Terabox] download API {err}")
         except Exception as e:
-            print(f"[Terabox] download API error: {e}")
-    return None, "download API failed all parameter combos"
+            errors.append(f"exc:{e}")
+            print(f"[Terabox] download API exception: {e}")
+
+    return None, "download API failed all combos — " + " | ".join(errors[:3])
 
 
 # ── Main resolver ──────────────────────────────────────────────────────────────
 
 def get_data(url: str, cookie: str) -> tuple[dict | None, str]:
     """
-    Returns (data_dict, "")        on success
+    Returns (data_dict, "")         on success
     Returns (None, "reason string") on failure  ← shown in Telegram
     """
     if not cookie:
@@ -317,35 +382,49 @@ def get_data(url: str, cookie: str) -> tuple[dict | None, str]:
     if not surl:
         return None, f"Could not extract surl from: {url}"
 
-    h        = _h(cookie)
-    bdstoken = _get_bdstoken(cookie, surl)
+    h                = _h(cookie)
+    bdstoken         = _get_bdstoken(cookie, surl)
     js_token, log_id = _get_js_token(surl, cookie)
+    sign, timestamp  = _get_sign(surl, cookie)   # FIX 1
 
-    print(f"\n[Terabox] ── surl={surl} | bds={'yes' if bdstoken else 'no'} | js={'yes' if js_token else 'no'} ──")
+    print(
+        f"\n[Terabox] ── surl={surl}"
+        f" | bds={'yes' if bdstoken else 'NO'}"
+        f" | js={'yes' if js_token else 'no'}"
+        f" | sign={'yes' if sign else 'NO'} ──"
+    )
 
     # ── Collect file info: try A → B → C ──────────────────────────────────────
-    files = shareid = uk = None
+
+    files   = None
+    shareid = ""
+    uk      = ""
+    # FIX 3: pre-initialise so they're always defined even if a branch is skipped
+    err_b   = "not attempted"
+    err_c   = "not attempted"
 
     # Strategy A: shorturlinfo
     files_a, shareid_a, uk_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
     if files_a:
         files, shareid, uk = files_a, shareid_a, uk_a
     else:
-        shareid, uk = shareid_a, uk_a   # might have gotten shareid/uk even without list
+        # May have gotten shareid/uk even without a file list
+        shareid, uk = shareid_a, uk_a
 
-    # Strategy B: share/list (only if A didn't give us files)
+    # Strategy B: share/list
     if not files:
         files_b, err_b = _try_share_list(surl, bdstoken, js_token, log_id, h)
         if files_b:
             files = files_b
 
-    # Strategy C: page scraping (last resort)
-    if not files:
+    # FIX 4: run Strategy C when files were found but shareid/uk are still missing.
+    # The download API needs shareid+uk; skipping C when B won was a silent bug.
+    if not files or not shareid or not uk:
         files_c, shareid_c, uk_c, err_c = _try_page_scrape(surl, cookie)
-        if files_c:
-            files   = files_c
-            shareid = shareid or shareid_c
-            uk      = uk or uk_c
+        if not files and files_c:
+            files = files_c
+        shareid = shareid or shareid_c
+        uk      = uk or uk_c
 
     if not files:
         return None, (
@@ -355,26 +434,29 @@ def get_data(url: str, cookie: str) -> tuple[dict | None, str]:
             f"C (page scrape): {err_c}"
         )
 
-    # Get shareid/uk if still missing
-    if not shareid or not uk:
-        shareid_x, uk_x = _try_shorturlinfo(surl, bdstoken, h)[1:3]
-        shareid = shareid or shareid_x
-        uk      = uk      or uk_x
-
-    file      = files[0]
-    fs_id     = str(file["fs_id"])
-    filename  = file.get("server_filename", "file")
-    size      = int(file.get("size", 0))
-    thumbs    = file.get("thumbs", {})
-    thumb     = thumbs.get("url3") or thumbs.get("url1") or ""
+    file       = files[0]
+    fs_id      = str(file["fs_id"])
+    filename   = file.get("server_filename", "file")
+    size       = int(file.get("size", 0))
+    thumbs     = file.get("thumbs", {})
+    thumb      = thumbs.get("url3") or thumbs.get("url1") or ""
     list_dlink = file.get("dlink", "")
 
-    print(f"[Terabox] File: {filename} | {get_formatted_size(size)}")
+    print(
+        f"[Terabox] File: {filename} | {get_formatted_size(size)}"
+        f" | shareid={'yes' if shareid else 'NO'}"
+        f" | uk={'yes' if uk else 'NO'}"
+    )
 
     # ── Download link ─────────────────────────────────────────────────────────
-    dlink, dl_err = _get_dlink(surl, fs_id, shareid, uk, js_token, bdstoken, log_id, h)
+    dlink, dl_err = _get_dlink(
+        surl, fs_id, shareid, uk,
+        js_token, bdstoken, log_id,
+        sign, timestamp,          # FIX 2
+        h,
+    )
     if not dlink and list_dlink:
-        print("[Terabox] Using dlink from file list")
+        print("[Terabox] Using dlink embedded in file list")
         dlink = list_dlink
     if not dlink:
         return None, f"Could not get download link: {dl_err}"
