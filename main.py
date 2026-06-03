@@ -4,6 +4,7 @@ import os
 import time
 from uuid import uuid4
 
+import requests
 import telethon
 import telethon.tl.types
 from telethon import Button, TelegramClient, events
@@ -33,7 +34,7 @@ from config import (
     TERABOX_COOKIE,
 )
 from database import Database
-from terabox import get_data
+from terabox import _BASE, _h, extract_surl, get_data
 from tools import (
     convert_seconds,
     download_file,
@@ -56,10 +57,9 @@ db  = Database(MONGO_URI, DB_NAME)
 SUPPORTED_EXTENSIONS = {".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".m4v"}
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
+# ── Branding helpers ──────────────────────────────────────────────────────────
 
 def nav_buttons():
-    """Build inline keyboard from your own branding config — omits empty entries."""
     rows = []
     if GITHUB_URL:
         rows.append([Button.url("Source Code", url=GITHUB_URL)])
@@ -76,14 +76,12 @@ def nav_buttons():
 
 
 def contact_text():
-    """Returns a contact line using BOT_OWNER, or a generic fallback."""
     if BOT_OWNER:
         return f"Contact {BOT_OWNER} for assistance."
     return "Contact the bot administrator for assistance."
 
 
 def footer():
-    """One-line footer for file captions — uses BOT_CHANNEL if set."""
     return f"\n{BOT_CHANNEL}" if BOT_CHANNEL else ""
 
 
@@ -109,7 +107,6 @@ async def start(m: UpdateNewMessage):
     user     = await bot.get_entity(user_id)
     name     = user.first_name
     username = user.username or "-"
-
     db.save_user(user_id, name, username)
 
     for admin_id in ADMINS:
@@ -149,7 +146,6 @@ async def start(m: UpdateNewMessage):
             f"╚═════════════════⍟\n"
             f"{contact_text()}"
         )
-
     await m.reply(body, link_preview=False, parse_mode="markdown", buttons=nav_buttons())
 
 
@@ -179,16 +175,16 @@ async def user_info(m: UpdateNewMessage):
 )
 async def command_help(m: UpdateNewMessage):
     await m.reply(
-        f"┏━━━━━━━━━━⍟\n"
-        f"┃ Available Commands\n"
-        f"┗━━━━━━━━━━━━━━━━━⍟\n\n"
-        f"/start       — Welcome message\n"
-        f"/info or /id — Your user details\n"
-        f"/redeem <code> — Redeem a gift code\n"
-        f"/plan        — See available plans\n"
-        f"/ping        — Check bot latency\n"
-        f"/help        — This message\n\n"
-        f"📎 Send any Terabox link to download!",
+        "┏━━━━━━━━━━⍟\n"
+        "┃ Available Commands\n"
+        "┗━━━━━━━━━━━━━━━━━⍟\n\n"
+        "/start         — Welcome message\n"
+        "/info or /id   — Your user details\n"
+        "/redeem <code> — Redeem a gift code\n"
+        "/plan          — See available plans\n"
+        "/ping          — Check bot latency\n"
+        "/help          — This message\n\n"
+        "📎 Send any Terabox link to download!",
         link_preview=False,
         parse_mode="markdown",
         buttons=nav_buttons(),
@@ -232,16 +228,13 @@ async def redeem_gift_code(m: UpdateNewMessage):
     code = m.pattern_match.group(1).strip()
     if not db.is_valid_code(code):
         return await m.reply("❌ Invalid or expired gift code.")
-
     user_id  = m.sender_id
     user     = await bot.get_entity(user_id)
     name     = user.first_name
     username = user.username or "-"
-
     db.consume_code(code)
     db.add_premium(user_id)
     db.save_user(user_id, name, username)
-
     for admin_id in ADMINS:
         try:
             await bot.send_message(
@@ -250,7 +243,6 @@ async def redeem_gift_code(m: UpdateNewMessage):
             )
         except Exception:
             pass
-
     await m.reply(
         "✅ Gift code redeemed! You are now a **Premium** user. 🎉",
         parse_mode="markdown",
@@ -259,11 +251,7 @@ async def redeem_gift_code(m: UpdateNewMessage):
 
 # ── Admin: /gc ────────────────────────────────────────────────────────────────
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/gc (\d+)$", incoming=True, outgoing=False, from_users=ADMINS
-    )
-)
+@bot.on(events.NewMessage(pattern=r"^/gc (\d+)$", incoming=True, outgoing=False, from_users=ADMINS))
 async def generate_gift_codes(m: UpdateNewMessage):
     qty   = int(m.pattern_match.group(1))
     codes = [f"{GIFT_PREFIX}-{str(uuid4())[:8].upper()}" for _ in range(qty)]
@@ -274,11 +262,7 @@ async def generate_gift_codes(m: UpdateNewMessage):
 
 # ── Admin: /pre ───────────────────────────────────────────────────────────────
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/pre (.+)$", incoming=True, outgoing=False, from_users=ADMINS
-    )
-)
+@bot.on(events.NewMessage(pattern=r"^/pre (.+)$", incoming=True, outgoing=False, from_users=ADMINS))
 async def promote_user(m: UpdateNewMessage):
     try:
         uid = int(m.pattern_match.group(1).strip())
@@ -292,11 +276,7 @@ async def promote_user(m: UpdateNewMessage):
 
 # ── Admin: /de ────────────────────────────────────────────────────────────────
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/de (.+)$", incoming=True, outgoing=False, from_users=ADMINS
-    )
-)
+@bot.on(events.NewMessage(pattern=r"^/de (.+)$", incoming=True, outgoing=False, from_users=ADMINS))
 async def demote_user(m: UpdateNewMessage):
     try:
         uid = int(m.pattern_match.group(1).strip())
@@ -310,11 +290,7 @@ async def demote_user(m: UpdateNewMessage):
 
 # ── Admin: /premium_users ─────────────────────────────────────────────────────
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/premium_users$", incoming=True, outgoing=False, from_users=ADMINS
-    )
-)
+@bot.on(events.NewMessage(pattern=r"^/premium_users$", incoming=True, outgoing=False, from_users=ADMINS))
 async def list_premium(m: UpdateNewMessage):
     ids = db.get_all_premium_user_ids()
     if not ids:
@@ -342,13 +318,9 @@ async def demote_all(m: UpdateNewMessage):
     await m.reply("✅ All premium users demoted.")
 
 
-# ── Admin: /remove (clear rate limits) ───────────────────────────────────────
+# ── Admin: /remove <user_id>  (clear rate limits) ─────────────────────────────
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/remove (.+)$", incoming=True, outgoing=False, from_users=ADMINS
-    )
-)
+@bot.on(events.NewMessage(pattern=r"^/remove (.+)$", incoming=True, outgoing=False, from_users=ADMINS))
 async def remove_rate_limit(m: UpdateNewMessage):
     try:
         uid = int(m.pattern_match.group(1).strip())
@@ -360,11 +332,7 @@ async def remove_rate_limit(m: UpdateNewMessage):
 
 # ── Admin: /stats ─────────────────────────────────────────────────────────────
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/stats$", incoming=True, outgoing=False, from_users=ADMINS
-    )
-)
+@bot.on(events.NewMessage(pattern=r"^/stats$", incoming=True, outgoing=False, from_users=ADMINS))
 async def bot_stats(m: UpdateNewMessage):
     total = db.get_user_count()
     prem  = len(db.get_all_premium_user_ids())
@@ -378,20 +346,14 @@ async def bot_stats(m: UpdateNewMessage):
 
 # ── Admin: /broadcast ─────────────────────────────────────────────────────────
 
-@bot.on(
-    events.NewMessage(
-        pattern=r"^/broadcast", incoming=True, outgoing=False, from_users=ADMINS
-    )
-)
+@bot.on(events.NewMessage(pattern=r"^/broadcast", incoming=True, outgoing=False, from_users=ADMINS))
 async def broadcast_message(m: UpdateNewMessage):
     text = m.text.split("/broadcast", 1)[1].strip()
     if not text:
         return await m.reply("❌ Usage: /broadcast <message>")
-
-    all_ids = db.get_all_user_ids()   # uses OUR MongoDB — no hardcoded group
+    all_ids = db.get_all_user_ids()
     sent = failed = 0
     status = await m.reply(f"📢 Broadcasting to {len(all_ids)} users…")
-
     for uid in all_ids:
         try:
             await bot.send_message(uid, text)
@@ -399,8 +361,140 @@ async def broadcast_message(m: UpdateNewMessage):
         except Exception:
             failed += 1
         await asyncio.sleep(0.05)
-
     await status.edit(f"✅ Done!\n✅ Sent: {sent}\n❌ Failed: {failed}")
+
+
+# ── Admin: /check_cookie ──────────────────────────────────────────────────────
+
+@bot.on(events.NewMessage(pattern=r"^/check_cookie$", incoming=True, outgoing=False, from_users=ADMINS))
+async def check_cookie(m: UpdateNewMessage):
+    """
+    Tests whether TERABOX_COOKIE is set and accepted by Terabox.
+    Sends results directly in Telegram — no need to check Railway logs.
+    """
+    msg = await m.reply("🔍 Testing TERABOX_COOKIE…")
+
+    if not TERABOX_COOKIE:
+        return await msg.edit(
+            "❌ **TERABOX_COOKIE is empty.**\n\n"
+            "Set it in Railway → Variables.\n"
+            "See env.example for instructions on how to get it.",
+            parse_mode="markdown",
+        )
+
+    # Check that the cookie string contains the most critical field
+    if "ndus=" not in TERABOX_COOKIE:
+        await msg.edit(
+            "⚠️ Cookie is set but may be incomplete — `ndus` field not found.\n"
+            "Make sure you copied the **entire** Cookie header value from DevTools.",
+            parse_mode="markdown",
+        )
+        return
+
+    # Make a lightweight authenticated request to Terabox
+    try:
+        r = requests.get(
+            "https://www.terabox.com/api/quota",
+            params={"checkexpire": "1", "checkfree": "1", "app_id": "250528"},
+            headers=_h(TERABOX_COOKIE),
+            timeout=15,
+        )
+        data   = r.json()
+        errno  = data.get("errno", -1)
+        errmsg = data.get("errmsg", "")
+
+        if errno == 0:
+            # Parse quota info if available
+            total = data.get("total", 0)
+            used  = data.get("used",  0)
+            free  = total - used
+            gb    = lambda b: f"{b / 1024**3:.1f} GB"
+            await msg.edit(
+                f"✅ **Cookie is valid!**\n\n"
+                f"📦 Total: {gb(total)}\n"
+                f"📂 Used:  {gb(used)}\n"
+                f"🆓 Free:  {gb(free)}",
+                parse_mode="markdown",
+            )
+        elif errno == -6:
+            await msg.edit(
+                "❌ **Cookie is expired or invalid** (errno -6).\n\n"
+                "Go to terabox.com → F12 → Network tab → copy a fresh Cookie header.",
+                parse_mode="markdown",
+            )
+        else:
+            await msg.edit(
+                f"⚠️ Terabox responded with errno={errno} (`{errmsg}`).\n"
+                "Cookie may still work for downloads — try sending a link.",
+                parse_mode="markdown",
+            )
+    except Exception as e:
+        await msg.edit(
+            f"❌ Request to Terabox failed: `{e}`\n\n"
+            "Check that Railway has outbound internet access.",
+            parse_mode="markdown",
+        )
+
+
+# ── Admin: /debug_link <url> ──────────────────────────────────────────────────
+
+@bot.on(events.NewMessage(pattern=r"^/debug_link (.+)$", incoming=True, outgoing=False, from_users=ADMINS))
+async def debug_link(m: UpdateNewMessage):
+    """
+    Runs the full Terabox resolver on a URL and reports every step's outcome
+    directly in Telegram — useful when a link fails to download.
+    """
+    url = m.pattern_match.group(1).strip()
+    msg = await m.reply(f"🔍 Debugging: `{url}`…", parse_mode="markdown")
+
+    if not TERABOX_COOKIE:
+        return await msg.edit("❌ TERABOX_COOKIE is not set.")
+
+    surl = extract_surl(url)
+    if not surl:
+        return await msg.edit(f"❌ Could not extract surl from:\n`{url}`", parse_mode="markdown")
+
+    h      = _h(TERABOX_COOKIE)
+    report = [f"**surl:** `{surl}`"]
+
+    # Step 1 — file list (no jsToken first, simplest)
+    try:
+        r     = requests.get(
+            "https://www.terabox.com/share/list",
+            params={"app_id": "250528", "web": "1", "shorturl": surl,
+                    "root": "1", "num": "5", "page": "1", "by": "name", "order": "asc"},
+            headers=h, timeout=20,
+        )
+        data  = r.json()
+        errno = data.get("errno", -1)
+        if errno == 0 and data.get("list"):
+            f0 = data["list"][0]
+            report.append(
+                f"**share/list:** ✅ errno=0\n"
+                f"  File: `{f0.get('server_filename')}`\n"
+                f"  fs_id: `{f0.get('fs_id')}`\n"
+                f"  size: `{f0.get('size')}`"
+            )
+        else:
+            hints = {-6: " (cookie expired)", -9: " (link dead)", 2: " (needs password)"}
+            report.append(f"**share/list:** ❌ errno={errno}{hints.get(errno, '')}")
+    except Exception as e:
+        report.append(f"**share/list:** ❌ exception: {e}")
+
+    # Step 2 — quota / cookie health
+    try:
+        qr    = requests.get("https://www.terabox.com/api/quota",
+                             params={"checkexpire": "1", "app_id": "250528"},
+                             headers=h, timeout=10)
+        qdata = qr.json()
+        qerrno = qdata.get("errno", -1)
+        report.append(
+            f"**cookie health:** {'✅ valid' if qerrno == 0 else f'❌ errno={qerrno}'}"
+        )
+    except Exception as e:
+        report.append(f"**cookie health:** ❌ exception: {e}")
+
+    await msg.edit("\n\n".join(report), parse_mode="markdown")
 
 
 # ── Chat-join tracking ────────────────────────────────────────────────────────
@@ -442,7 +536,6 @@ async def gate_message(m: Message):
 async def handle_message(m: Message):
     user_id = m.sender_id
 
-    # Keep user record fresh on every interaction
     try:
         user = await bot.get_entity(user_id)
         db.save_user(user_id, user.first_name, user.username)
@@ -456,7 +549,7 @@ async def handle_message(m: Message):
     if not await check_required_channels(m):
         return
 
-    # ── Cooldown check ────────────────────────────────────────────────────────
+    # ── Cooldown ──────────────────────────────────────────────────────────────
     if db.is_on_cooldown(user_id) and user_id not in ADMINS:
         cd = PREMIUM_COOLDOWN if db.is_premium(user_id) else FREE_COOLDOWN
         return await m.reply(f"⏳ Please wait {cd} seconds before your next request.")
@@ -495,15 +588,14 @@ async def handle_message(m: Message):
             db.increment_usage(user_id)
             return
 
-    # ── Resolve the link ──────────────────────────────────────────────────────
-    data = get_data(url, cookie=TERABOX_COOKIE)
+    # ── Resolve link (now returns tuple with error detail) ────────────────────
+    data, resolve_error = get_data(url, cookie=TERABOX_COOKIE)
     if not data:
         return await hm.edit(
-            "❌ Could not resolve this Terabox link.\n\n"
-            "Possible causes:\n"
-            "• The link has expired or is broken\n"
-            "• TERABOX_COOKIE is missing or expired\n"
-            "• The file requires a Terabox password"
+            f"❌ Could not resolve this Terabox link.\n\n"
+            f"**Reason:** `{resolve_error}`\n\n"
+            f"If the reason says _cookie expired_, use /check\\_cookie to diagnose.",
+            parse_mode="markdown",
         )
 
     # ── File-type guard ───────────────────────────────────────────────────────
@@ -523,7 +615,7 @@ async def handle_message(m: Message):
             parse_mode="markdown",
         )
 
-    # ── Progress bar callback ─────────────────────────────────────────────────
+    # ── Progress bar ──────────────────────────────────────────────────────────
     start_time = time.time()
     cansend    = CanSend()
 
@@ -547,7 +639,7 @@ async def handle_message(m: Message):
         except Exception:
             pass
 
-    # ── Caption (no hardcoded names) ──────────────────────────────────────────
+    # ── Caption ───────────────────────────────────────────────────────────────
     user_name  = m.sender.first_name if m.sender else "Unknown"
     user_uname = (m.sender.username or "-") if m.sender else "-"
     caption = (
@@ -566,8 +658,8 @@ async def handle_message(m: Message):
         if data.get("thumb") else None
     )
 
-    # ── Upload to private storage channel ────────────────────────────────────
-    file          = None
+    # ── Upload ────────────────────────────────────────────────────────────────
+    file           = None
     local_download = None
 
     try:
