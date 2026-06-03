@@ -34,7 +34,7 @@ from config import (
     TERABOX_COOKIE,
 )
 from database import Database
-from terabox import _BASE, _h, extract_surl, get_data
+from terabox import _BASE, _h, _cookie_field, extract_surl, get_data
 from tools import (
     convert_seconds,
     download_file,
@@ -457,14 +457,23 @@ async def debug_link(m: UpdateNewMessage):
     h      = _h(TERABOX_COOKIE)
     report = [f"**surl:** `{surl}`"]
 
-    # Step 1 — file list (no jsToken first, simplest)
+    # Step 1 — bdstoken (the errno=4000020 fix)
+    bdstoken = _cookie_field(TERABOX_COOKIE, "csrfToken")
+    if bdstoken:
+        report.append(f"**bdstoken (csrfToken):** ✅ found — `{bdstoken[:16]}…`")
+    else:
+        report.append("**bdstoken (csrfToken):** ❌ NOT in cookie — this causes errno=4000020")
+
+    # Step 2 — file list WITH bdstoken
     try:
-        r     = requests.get(
-            "https://www.terabox.com/share/list",
-            params={"app_id": "250528", "web": "1", "shorturl": surl,
-                    "root": "1", "num": "5", "page": "1", "by": "name", "order": "asc"},
-            headers=h, timeout=20,
-        )
+        params = {
+            "app_id": "250528", "web": "1", "shorturl": surl,
+            "root": "1", "num": "5", "page": "1", "by": "name", "order": "asc",
+        }
+        if bdstoken:
+            params["bdstoken"] = bdstoken
+        r     = requests.get("https://www.terabox.com/share/list",
+                             params=params, headers=h, timeout=20)
         data  = r.json()
         errno = data.get("errno", -1)
         if errno == 0 and data.get("list"):
@@ -472,21 +481,24 @@ async def debug_link(m: UpdateNewMessage):
             report.append(
                 f"**share/list:** ✅ errno=0\n"
                 f"  File: `{f0.get('server_filename')}`\n"
-                f"  fs_id: `{f0.get('fs_id')}`\n"
+                f"  fs\\_id: `{f0.get('fs_id')}`\n"
                 f"  size: `{f0.get('size')}`"
             )
         else:
-            hints = {-6: " (cookie expired)", -9: " (link dead)", 2: " (needs password)"}
+            hints = {
+                -6: " (cookie expired)", -9: " (link dead)",
+                2: " (needs password)", 4000020: " (bdstoken missing/wrong)",
+            }
             report.append(f"**share/list:** ❌ errno={errno}{hints.get(errno, '')}")
     except Exception as e:
         report.append(f"**share/list:** ❌ exception: {e}")
 
-    # Step 2 — quota / cookie health
+    # Step 3 — quota / cookie health
     try:
-        qr    = requests.get("https://www.terabox.com/api/quota",
-                             params={"checkexpire": "1", "app_id": "250528"},
-                             headers=h, timeout=10)
-        qdata = qr.json()
+        qr     = requests.get("https://www.terabox.com/api/quota",
+                              params={"checkexpire": "1", "app_id": "250528"},
+                              headers=h, timeout=10)
+        qdata  = qr.json()
         qerrno = qdata.get("errno", -1)
         report.append(
             f"**cookie health:** {'✅ valid' if qerrno == 0 else f'❌ errno={qerrno}'}"
