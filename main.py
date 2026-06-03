@@ -437,13 +437,19 @@ async def check_cookie(m: UpdateNewMessage):
 
 
 # ── Admin: /debug_link <url> ──────────────────────────────────────────────────
+# ── Admin: /debug_link <url> ──────────────────────────────────────────────────
 
 @bot.on(events.NewMessage(pattern=r"^/debug_link (.+)$", incoming=True, outgoing=False, from_users=ADMINS))
 async def debug_link(m: UpdateNewMessage):
     """
-    Runs the full Terabox resolver on a URL and reports every step's outcome
-    directly in Telegram — useful when a link fails to download.
+    Tests all three file-info strategies against a URL and reports each result
+    directly in Telegram — no need to check Railway logs.
     """
+    from terabox import (
+        _try_shorturlinfo, _try_share_list, _try_page_scrape,
+        _get_bdstoken, _get_js_token,
+    )
+
     url = m.pattern_match.group(1).strip()
     msg = await m.reply(f"🔍 Debugging: `{url}`…", parse_mode="markdown")
 
@@ -454,57 +460,75 @@ async def debug_link(m: UpdateNewMessage):
     if not surl:
         return await msg.edit(f"❌ Could not extract surl from:\n`{url}`", parse_mode="markdown")
 
-    h      = _h(TERABOX_COOKIE)
-    report = [f"**surl:** `{surl}`"]
+    h        = _h(TERABOX_COOKIE)
+    bdstoken = _get_bdstoken(TERABOX_COOKIE, surl)
+    js_token, log_id = _get_js_token(surl, TERABOX_COOKIE)
 
-    # Step 1 — bdstoken (the errno=4000020 fix)
-    bdstoken = _cookie_field(TERABOX_COOKIE, "csrfToken")
-    if bdstoken:
-        report.append(f"**bdstoken (csrfToken):** ✅ found — `{bdstoken[:16]}…`")
+    report = [
+        f"**surl:** `{surl}`",
+        f"**bdstoken:** {chr(10004) + ' `' + bdstoken[:16] + '…`' if bdstoken else chr(10060) + ' not found'}",
+        f"**jsToken:**  {chr(10004) + ' found' if js_token else chr(9888) + ' not found (non-fatal)'}",
+    ]
+
+    await msg.edit("\n".join(report) + "\n\n⏳ Testing Strategy A…", parse_mode="markdown")
+
+    # Strategy A: shorturlinfo
+    files_a, shareid_a, uk_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
+    if files_a:
+        f0 = files_a[0]
+        report.append(
+            f"**A (shorturlinfo):** ✅\n"
+            f"  File: `{f0.get('server_filename', '?')}`\n"
+            f"  Size: `{f0.get('size', '?')}`\n"
+            f"  shareid: `{shareid_a}`"
+        )
     else:
-        report.append("**bdstoken (csrfToken):** ❌ NOT in cookie — this causes errno=4000020")
+        report.append(f"**A (shorturlinfo):** ❌ {err_a}")
 
-    # Step 2 — file list WITH bdstoken
-    try:
-        params = {
-            "app_id": "250528", "web": "1", "shorturl": surl,
-            "root": "1", "num": "5", "page": "1", "by": "name", "order": "asc",
-        }
-        if bdstoken:
-            params["bdstoken"] = bdstoken
-        r     = requests.get("https://www.terabox.com/share/list",
-                             params=params, headers=h, timeout=20)
-        data  = r.json()
-        errno = data.get("errno", -1)
-        if errno == 0 and data.get("list"):
-            f0 = data["list"][0]
-            report.append(
-                f"**share/list:** ✅ errno=0\n"
-                f"  File: `{f0.get('server_filename')}`\n"
-                f"  fs\\_id: `{f0.get('fs_id')}`\n"
-                f"  size: `{f0.get('size')}`"
-            )
-        else:
-            hints = {
-                -6: " (cookie expired)", -9: " (link dead)",
-                2: " (needs password)", 4000020: " (bdstoken missing/wrong)",
-            }
-            report.append(f"**share/list:** ❌ errno={errno}{hints.get(errno, '')}")
-    except Exception as e:
-        report.append(f"**share/list:** ❌ exception: {e}")
+    await msg.edit("\n\n".join(report) + "\n\n⏳ Testing Strategy B…", parse_mode="markdown")
 
-    # Step 3 — quota / cookie health
+    # Strategy B: share/list
+    files_b, err_b = _try_share_list(surl, bdstoken, js_token, log_id, h)
+    if files_b:
+        f0 = files_b[0]
+        report.append(
+            f"**B (share/list):** ✅\n"
+            f"  File: `{f0.get('server_filename', '?')}`\n"
+            f"  fs_id: `{f0.get('fs_id', '?')}`"
+        )
+    else:
+        report.append(f"**B (share/list):** ❌ {err_b}")
+
+    await msg.edit("\n\n".join(report) + "\n\n⏳ Testing Strategy C…", parse_mode="markdown")
+
+    # Strategy C: page scrape
+    files_c, shareid_c, uk_c, err_c = _try_page_scrape(surl, TERABOX_COOKIE)
+    if files_c:
+        f0 = files_c[0]
+        report.append(
+            f"**C (page scrape):** ✅\n"
+            f"  File: `{f0.get('server_filename', '?')}`\n"
+            f"  dlink in list: {'yes' if f0.get('dlink') else 'no'}"
+        )
+    else:
+        report.append(f"**C (page scrape):** ❌ {err_c}")
+
+    # Cookie health check
     try:
         qr     = requests.get("https://www.terabox.com/api/quota",
                               params={"checkexpire": "1", "app_id": "250528"},
                               headers=h, timeout=10)
-        qdata  = qr.json()
-        qerrno = qdata.get("errno", -1)
-        report.append(
-            f"**cookie health:** {'✅ valid' if qerrno == 0 else f'❌ errno={qerrno}'}"
-        )
+        qerrno = qr.json().get("errno", -1)
+        report.append(f"**Cookie health:** {'✅ valid' if qerrno == 0 else f'❌ errno={qerrno}'}")
     except Exception as e:
-        report.append(f"**cookie health:** ❌ exception: {e}")
+        report.append(f"**Cookie health:** ❌ {e}")
+
+    any_ok = files_a or files_b or files_c
+    report.append(
+        "**Overall:** ✅ At least one strategy works — download should succeed."
+        if any_ok else
+        "**Overall:** ❌ All strategies failed. Send this output for further help."
+    )
 
     await msg.edit("\n\n".join(report), parse_mode="markdown")
 
