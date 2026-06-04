@@ -140,11 +140,31 @@ def _get_sign(surl: str, cookie: str) -> tuple[str, str]:
       2. /api/getsign         — explicit sign endpoint, needs clienttype param
       3. Page HTML scraping   — last resort; only works on WAP/legacy pages
     """
-    h = _h(cookie)
+    h        = _h(cookie)
+    bdstoken = _cookie_field(cookie, "csrfToken")
+
+    # ── Method 0: shorturlinfo ────────────────────────────────────────────────
+    # The sign is a per-share token returned alongside shareid/uk.
+    # Session-level endpoints (gettemplatevariable, getsign) return empty
+    # bodies from some server locations — shorturlinfo is more reliable.
+    for params in [
+        {"app_id": "250528", "web": "1", "shorturl": surl, "root": "1", "bdstoken": bdstoken},
+        {"app_id": "250528", "web": "1", "shorturl": surl, "root": "1"},
+    ]:
+        try:
+            r    = requests.get("https://www.terabox.com/api/shorturlinfo",
+                                params=params, headers=h, timeout=20)
+            data = r.json()
+            if data.get("errno") == 0:
+                sign = str(data.get("sign", ""))
+                ts   = str(data.get("timestamp", ""))
+                if sign:
+                    print(f"[Terabox] sign from shorturlinfo (standalone): …{sign[-8:]}")
+                    return sign, ts
+        except Exception as e:
+            print(f"[Terabox] _get_sign shorturlinfo: {e}")
 
     # ── Method 1: gettemplatevariable ─────────────────────────────────────────
-    # The same endpoint already used for bdstoken.  Pass sign+timestamp
-    # in the fields array — Terabox returns them when a valid session exists.
     try:
         r = requests.get(
             "https://www.terabox.com/api/gettemplatevariable",
@@ -228,8 +248,15 @@ def _get_sign(surl: str, cookie: str) -> tuple[str, str]:
 
 # ── File info strategies ───────────────────────────────────────────────────────
 
-def _try_shorturlinfo(surl: str, bdstoken: str, h: dict) -> tuple[list | None, str, str, str]:
-    """Strategy A — shorturlinfo. Returns (files, shareid, uk, error)."""
+def _try_shorturlinfo(surl: str, bdstoken: str, h: dict) -> tuple:
+    """
+    Strategy A — shorturlinfo.
+    Returns (files, shareid, uk, sign, timestamp, error).
+
+    The shorturlinfo response carries sign+timestamp alongside shareid/uk.
+    These are the correct per-share tokens for /api/download — session-level
+    endpoints like gettemplatevariable return empty bodies on Railway.
+    """
     for params in [
         {"app_id": "250528", "web": "1", "shorturl": surl, "root": "1", "bdstoken": bdstoken},
         {"app_id": "250528", "web": "1", "shorturl": surl, "root": "1"},
@@ -242,16 +269,20 @@ def _try_shorturlinfo(surl: str, bdstoken: str, h: dict) -> tuple[list | None, s
             errno = data.get("errno", -1)
             if errno != 0:
                 continue
-            shareid = str(data.get("shareid", ""))
-            uk      = str(data.get("uk", ""))
-            files   = data.get("list", [])
+            shareid   = str(data.get("shareid", ""))
+            uk        = str(data.get("uk", ""))
+            sign      = str(data.get("sign", ""))
+            timestamp = str(data.get("timestamp", ""))
+            files     = data.get("list", [])
+            if sign:
+                print(f"[Terabox] sign from shorturlinfo: …{sign[-8:]}")
             if files:
                 print(f"[Terabox] ✅ Strategy A (shorturlinfo) — {len(files)} file(s)")
-                return files, shareid, uk, ""
-            return None, shareid, uk, "shorturlinfo returned no list"
+                return files, shareid, uk, sign, timestamp, ""
+            return None, shareid, uk, sign, timestamp, "shorturlinfo returned no list"
         except Exception:
             continue
-    return None, "", "", "shorturlinfo failed all parameter combos"
+    return None, "", "", "", "", "shorturlinfo failed all parameter combos"
 
 
 def _try_share_list(surl: str, bdstoken: str, js_token: str,
@@ -421,11 +452,16 @@ def get_data(url: str, cookie: str) -> tuple[dict | None, str]:
     err_b   = "not attempted"
     err_c   = "not attempted"
 
-    files_a, shareid_a, uk_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
+    files_a, shareid_a, uk_a, sign_a, ts_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
     if files_a:
         files, shareid, uk = files_a, shareid_a, uk_a
     else:
         shareid, uk = shareid_a, uk_a
+    # Capture sign+timestamp from Strategy A response — more reliable than
+    # session-level endpoints which return empty bodies on some deployments.
+    if sign_a and not sign:
+        sign, timestamp = sign_a, ts_a
+        print(f"[Terabox] using sign from Strategy A response")
 
     if not files:
         files_b, err_b = _try_share_list(surl, bdstoken, js_token, log_id, h)
