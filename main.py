@@ -439,16 +439,13 @@ async def check_cookie(m: UpdateNewMessage):
 # ── Admin: /debug_link <url> ──────────────────────────────────────────────────
 # ── Admin: /debug_link <url> ───────────────────────────────────────────────────
 # Replace the ENTIRE existing /debug_link handler in main.py with this block.
+# Also add  from terabox import extract_surl  if not already imported at top.
 
 @bot.on(events.NewMessage(pattern=r"^/debug_link (.+)$", incoming=True, outgoing=False, from_users=ADMINS))
 async def debug_link(m: UpdateNewMessage):
-    """
-    Tests sign retrieval + all three file-info strategies and reports inline.
-    """
     from terabox import (
         _try_shorturlinfo, _try_share_list, _try_page_scrape,
-        _get_bdstoken, _get_js_token, _get_sign,
-        _h,
+        _get_bdstoken, _get_js_token, _headers,
     )
 
     url = m.pattern_match.group(1).strip()
@@ -459,70 +456,18 @@ async def debug_link(m: UpdateNewMessage):
 
     surl = extract_surl(url)
     if not surl:
-        return await msg.edit(f"❌ Could not extract surl:\n`{url}`", parse_mode="markdown")
+        return await msg.edit(f"❌ Cannot extract surl from `{url}`", parse_mode="markdown")
 
-    h        = _h(TERABOX_COOKIE)
-    bdstoken = _get_bdstoken(TERABOX_COOKIE, surl)
+    h        = _headers(TERABOX_COOKIE, referer=f"https://www.terabox.com/s/{surl}")
+    bdstoken = _get_bdstoken(TERABOX_COOKIE)
     js_token, log_id = _get_js_token(surl, TERABOX_COOKIE)
 
     report = [
         f"**surl:** `{surl}`",
         f"**bdstoken:** {'✅ `' + bdstoken[:16] + '…`' if bdstoken else '❌ not found'}",
-        f"**jsToken:**  {'✅ found' if js_token else '⚠️ not found (non-fatal)'}",
+        f"**jsToken:** {'✅' if js_token else '⚠️ not found (non-fatal)'}",
     ]
-
-    await msg.edit("\n".join(report) + "\n\n⏳ Fetching sign…", parse_mode="markdown")
-
-    # ── Test each sign method individually ────────────────────────────────────
-    sign_source = "none"
-
-    # Method 1: gettemplatevariable
-    try:
-        r = requests.get(
-            "https://www.terabox.com/api/gettemplatevariable",
-            params={"fields": '["sign","timestamp"]'},
-            headers=h, timeout=10,
-        )
-        result   = r.json().get("result", {})
-        sign_gtv = result.get("sign", "")
-        ts_gtv   = str(result.get("timestamp", ""))
-        if sign_gtv:
-            sign_source = "gettemplatevariable"
-            report.append(f"**sign (gettemplatevariable):** ✅ `…{sign_gtv[-12:]}`\n  ts={ts_gtv}")
-        else:
-            report.append(f"**sign (gettemplatevariable):** ❌ empty — result=`{result}`")
-    except Exception as e:
-        sign_gtv = ""
-        report.append(f"**sign (gettemplatevariable):** ❌ error: `{e}`")
-
-    # Method 2: /api/getsign
-    sign_gs = ""
-    for params in [{"clienttype": "0", "app_id": "250528", "web": "1"}, {"clienttype": "0"}]:
-        try:
-            r      = requests.get("https://www.terabox.com/api/getsign",
-                                  params=params, headers=h, timeout=10)
-            data   = r.json()
-            sign_gs = data.get("sign", "")
-            if sign_gs:
-                if sign_source == "none":
-                    sign_source = "getsign"
-                report.append(
-                    f"**sign (/api/getsign params={list(params.keys())}):** ✅ `…{sign_gs[-12:]}`\n"
-                    f"  errno={data.get('errno')} ts={data.get('timestamp')}"
-                )
-                break
-            else:
-                report.append(f"**sign (/api/getsign {list(params.keys())}):** ❌ errno={data.get('errno')} — `{data}`")
-        except Exception as e:
-            report.append(f"**sign (/api/getsign):** ❌ `{e}`")
-
-    sign, timestamp = _get_sign(surl, TERABOX_COOKIE)
-    report.append(
-        f"**sign (final):** {'✅ found via ' + sign_source if sign else '❌ NOT found — download will return errno=2'}"
-    )
-
-    await msg.edit("\n\n".join(report) + "\n\n⏳ Testing file-info strategies…",
-                   parse_mode="markdown")
+    await msg.edit("\n".join(report) + "\n\n⏳ Strategy A…", parse_mode="markdown")
 
     # ── Strategy A ────────────────────────────────────────────────────────────
     files_a, shareid_a, uk_a, sign_a, ts_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
@@ -530,16 +475,15 @@ async def debug_link(m: UpdateNewMessage):
         f0 = files_a[0]
         report.append(
             f"**A (shorturlinfo):** ✅ {len(files_a)} file(s)\n"
-            f"  `{f0.get('server_filename','?')}` {f0.get('size','?')} bytes\n"
+            f"  `{f0.get('server_filename','?')}` — {f0.get('size','?')} bytes\n"
             f"  shareid=`{shareid_a}` uk=`{uk_a}`\n"
-            f"  sign in response: {'✅ `…' + sign_a[-8:] + '`' if sign_a else '❌ missing'}\n"
+            f"  sign={'✅ `…' + sign_a[-8:] + '`' if sign_a else '❌ missing'}\n"
             f"  dlink in response: {'yes' if f0.get('dlink') else 'no'}"
         )
     else:
         report.append(
             f"**A (shorturlinfo):** ❌ {err_a}\n"
-            f"  shareid=`{shareid_a or 'none'}` uk=`{uk_a or 'none'}`\n"
-            f"  sign=`{sign_a or 'none'}`"
+            f"  shareid=`{shareid_a or 'none'}` sign=`{sign_a or 'none'}`"
         )
 
     await msg.edit("\n\n".join(report) + "\n\n⏳ Strategy B…", parse_mode="markdown")
@@ -550,8 +494,7 @@ async def debug_link(m: UpdateNewMessage):
         f0 = files_b[0]
         report.append(
             f"**B (share/list):** ✅ {len(files_b)} file(s)\n"
-            f"  `{f0.get('server_filename','?')}`\n"
-            f"  dlink in response: {'✅ yes' if f0.get('dlink') else '❌ no'}"
+            f"  dlink: {'✅ present' if f0.get('dlink') else '❌ missing'}"
         )
     else:
         report.append(f"**B (share/list):** ❌ {err_b}")
@@ -579,21 +522,19 @@ async def debug_link(m: UpdateNewMessage):
     except Exception as e:
         report.append(f"**Cookie:** ❌ {e}")
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    any_files = files_a or files_b or files_c
-    if not any_files:
+    # ── Verdict ───────────────────────────────────────────────────────────────
+    has_files = files_a or files_b or files_c
+    has_sign  = bool(sign_a)
+    has_dlink = (files_b and files_b[0].get("dlink")) or (files_a and files_a[0].get("dlink"))
+
+    if not has_files:
         verdict = "❌ No file-info strategy worked."
-    elif not sign:
-        b_has_dlink = files_b and files_b[0].get("dlink")
-        verdict = (
-            "⚠️ Files found but **sign is missing**.\n"
-            + ("✅ Strategy B has dlink — sign-free fallback will be used."
-               if b_has_dlink else
-               "❌ Strategy B has no dlink either — download will fail.\n"
-               "   Check if your Terabox account cookie has full API access.")
-        )
+    elif has_dlink:
+        verdict = "✅ Pre-signed dlink available — download should succeed without /api/download."
+    elif has_sign:
+        verdict = "✅ sign found — /api/download will be tried with fixed params (shareid lowercase, channel=dubox)."
     else:
-        verdict = "✅ All good — download should succeed."
+        verdict = "❌ sign missing AND no dlink — download will fail."
 
     report.append(f"**Verdict:** {verdict}")
     await msg.edit("\n\n".join(report), parse_mode="markdown")
