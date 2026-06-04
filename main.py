@@ -525,19 +525,21 @@ async def debug_link(m: UpdateNewMessage):
                    parse_mode="markdown")
 
     # ── Strategy A ────────────────────────────────────────────────────────────
-    files_a, shareid_a, uk_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
+    files_a, shareid_a, uk_a, sign_a, ts_a, err_a = _try_shorturlinfo(surl, bdstoken, h)
     if files_a:
         f0 = files_a[0]
         report.append(
             f"**A (shorturlinfo):** ✅ {len(files_a)} file(s)\n"
             f"  `{f0.get('server_filename','?')}` {f0.get('size','?')} bytes\n"
             f"  shareid=`{shareid_a}` uk=`{uk_a}`\n"
+            f"  sign in response: {'✅ `…' + sign_a[-8:] + '`' if sign_a else '❌ missing'}\n"
             f"  dlink in response: {'yes' if f0.get('dlink') else 'no'}"
         )
     else:
         report.append(
             f"**A (shorturlinfo):** ❌ {err_a}\n"
-            f"  shareid=`{shareid_a or 'none'}` uk=`{uk_a or 'none'}`"
+            f"  shareid=`{shareid_a or 'none'}` uk=`{uk_a or 'none'}`\n"
+            f"  sign=`{sign_a or 'none'}`"
         )
 
     await msg.edit("\n\n".join(report) + "\n\n⏳ Strategy B…", parse_mode="markdown")
